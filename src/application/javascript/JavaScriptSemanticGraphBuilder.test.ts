@@ -6,6 +6,8 @@ import { expect, it } from "vitest";
 import {
   SEMANTIC_GRAPH_FILE_NODE_CEILING,
   SEMANTIC_GRAPH_NODE_CEILING,
+  createJavaScriptSemanticGraphProjection,
+  projectJavaScriptSemanticFileSteps,
 } from "./JavaScriptSemanticGraphBuilder.js";
 import {
   addSemanticGraphNode,
@@ -60,6 +62,44 @@ it("projects closure and direct interprocedural flow without execution", () => {
       "defines",
       "reads",
     ]),
+  );
+});
+
+it.each([
+  ["direct assignment", "source.count = 2;"],
+  ["destructuring assignment", "[source.count] = [2];"],
+  ["for-of head", "for (source.count of [4]) {}"],
+  ["for-in head", "for (source.count in { key: true }) {}"],
+  ["delete", "delete source.count;"],
+])("projects a %s member target as a property write", (_name, statement) => {
+  const graph = graphFor(`const source = { count: 1 }; ${statement}`);
+  const operations = graph.nodes.filter(
+    ({ properties }) => properties.operation_kind !== undefined,
+  );
+  expect(operations.map(({ label }) => label)).toEqual(["write:/count"]);
+  const write = operations[0];
+  if (write === undefined) throw new Error("Expected write operation node");
+  expect(graph.relations).toContainEqual(
+    expect.objectContaining({
+      source_node_id: write.node_id,
+      relation: "writes-property",
+    }),
+  );
+  expect(graph.relations).not.toContainEqual(
+    expect.objectContaining({
+      source_node_id: write.node_id,
+      relation: "reads-property",
+    }),
+  );
+});
+
+it("continues to project an ordinary member access as a property read", () => {
+  const graph = graphFor(`
+    const source = { count: 1 };
+    const value = source.count;
+  `);
+  expect(graph.relations).toContainEqual(
+    expect.objectContaining({ relation: "reads-property" }),
   );
 });
 
@@ -905,3 +945,48 @@ it.each(["{}", "unknownRoot", "{ a: null }"])(
     expect(trace.nodes.filter(({ kind }) => kind === "literal")).toEqual([]);
   },
 );
+
+it("projects and adopts more than the default per-file capacity when explicitly offered", () => {
+  const text = "external;\n".repeat(20_001);
+  const file: JavaScriptArtifactFile = {
+    path: "large.js",
+    container_sha256: SHA256,
+    sha256: SHA256,
+    bytes: Buffer.byteLength(text),
+    inventory_artifact_id: `art_${SHA256}`,
+    kind: "javascript",
+    unpacked: false,
+    text: { included: true, value: text },
+  };
+  const steps = projectJavaScriptSemanticFileSteps(
+    file,
+    analyzeJavaScriptSemantics(text),
+    20_002,
+  );
+  let result = steps.next();
+  while (!result.done) result = steps.next();
+  expect(result.value.nodes).toHaveLength(20_002);
+  expect(result.value.truncated).toBe(false);
+  const projection = createJavaScriptSemanticGraphProjection({
+    totalNodes: 20_010,
+    fileNodes: 20_002,
+  });
+  projection.adoptFileProjection(result.value);
+  expect(projection.remainingFileNodeBudget()).toBe(8);
+  const graph = projection.finish(SHA256, {
+    graph_id: `jag_${"b".repeat(64)}`,
+    nodes: [],
+  });
+  expect(graph.coverage).toMatchObject({
+    truncated: false,
+    omitted_nodes: 0,
+    omitted_relations: 0,
+  });
+  const bounded = createJavaScriptSemanticGraphProjection({
+    totalNodes: 20_001,
+    fileNodes: 20_002,
+  });
+  expect(() => bounded.adoptFileProjection(result.value)).toThrow(
+    "exceed the offered tree capacity",
+  );
+});

@@ -2,7 +2,6 @@ import * as t from "@babel/types";
 import {
   decodeValidatedSourceMapLeaves,
   isBeforeSourceMapLeafStop,
-  resolveSourceMapSource,
 } from "../javascript/sourceMaps/DecodedSourceMap.js";
 
 import { sanitizeBrowserUrl } from "../domain/browserObservation.js";
@@ -12,6 +11,11 @@ import { isUrlLikeModuleSpecifier } from "../domain/webBundleAnalyzerAst.js";
 import { analyzeParsedJavaScriptReferences } from "../domain/javascript/javascriptSemanticAnalysis.js";
 import { traverseJavaScriptAst } from "../domain/javascript/javascriptSemanticTraversal.js";
 import { parseJavaScriptSource } from "../domain/javascript/javascriptSourceParser.js";
+import {
+  isTypeOnlyExportDeclaration,
+  isTypeOnlyImportDeclaration,
+} from "../domain/javascript/javascriptModuleDeclaration.js";
+import { stringValue } from "../domain/javascript/javascriptStaticAnalysisHelpers.js";
 import type {
   AnalyzeWebBundleInput,
   WebSourceMapItem,
@@ -20,10 +24,11 @@ import type {
 import { webSourceMapsSchema } from "../domain/webBundleAnalysis.js";
 import { createWebTextArtifact } from "../domain/webContentArtifact.js";
 import { safeParseJson } from "../domain/safeJson.js";
+import { sourceMapJsonText } from "../domain/sourceMapEnvelope.js";
+import { resolveJavaScriptSourceMapUrl } from "../domain/javascript/javascriptSourceMapPaths.js";
 import { jsonParts } from "../domain/jsonSerialization.js";
 import {
   inspectSourceMapValue,
-  sourceMapJsonText,
   SourceMapFormatFailure,
   type SourceMapLeaf,
 } from "../javascript/sourceMaps/SourceMapFormat.js";
@@ -86,7 +91,7 @@ export const fetchWebSourceMaps = async (
   signal?.addEventListener("abort", abortFromCaller, { once: true });
   const operationSignal = operationController.signal;
   const deadlineAt =
-    Date.now() + (host.timeoutMs ?? SOURCE_MAP_FETCH_TIMEOUT_MS);
+    performance.now() + (host.timeoutMs ?? SOURCE_MAP_FETCH_TIMEOUT_MS);
   const budget = {
     retainedBytes: 0,
     deadlineAt,
@@ -110,7 +115,7 @@ export const fetchWebSourceMaps = async (
       }
       const expandedBytesBeforeItem = budget.decodedRecords.expandedBytes;
       budget.decodedRecords.expandedBytes += reservation;
-      if (operationSignal.aborted || Date.now() >= deadlineAt) {
+      if (operationSignal.aborted || performance.now() >= deadlineAt) {
         items.push(
           emptySourceMapItem(
             request,
@@ -567,17 +572,21 @@ const normalizeSourceMap = (
     const sourceJsonBytes = new Map<string, number>();
     const nameJsonBytes = new Map<string, number>();
     const originalSources: ParsedSourceMapItem["original_sources"] = [];
+    let declarationIndex = 0;
     for (const { leaf, resolvedSources } of decoded) {
       for (const [index, rawSource] of leaf.map.sources.entries()) {
         if ((index & 255) === 0) check();
         const resolved =
-          resolvedSources[index] ?? rawSource ?? "[unknown-source]";
-        const sanitized = cachedSanitized(sourcesByRaw, resolved);
+          rawSource === null ? null : (resolvedSources[index] ?? null);
+        const sanitized =
+          resolved === null ? null : cachedSanitized(sourcesByRaw, resolved);
         const content = leaf.map.sourcesContent?.[index] ?? null;
         consumeExpandedBytes(
           context.budget,
-          cachedJsonBytes(sourceJsonBytes, sanitized) +
-            sourceEntryOverheadBytes() +
+          (sanitized === null
+            ? 4
+            : cachedJsonBytes(sourceJsonBytes, sanitized)) +
+            sourceEntryOverheadBytes(index, declarationIndex) +
             (originalSources.length === 0 ? 0 : 1) +
             (content === null
               ? 0
@@ -586,6 +595,8 @@ const normalizeSourceMap = (
                 4),
         );
         originalSources.push({
+          source_index: index,
+          declaration_index: declarationIndex++,
           source: sanitized,
           artifact:
             content === null
@@ -595,16 +606,21 @@ const normalizeSourceMap = (
       }
     }
     const mappings: ParsedSourceMapItem["mappings"] = [];
-    for (const { leaf, rows, resolvedSources } of decoded)
+    declarationIndex = 0;
+    for (const { leaf, rows, resolvedSources } of decoded) {
+      const declarationBase = declarationIndex;
+      declarationIndex += leaf.map.sources.length;
       for (const [line, row] of rows.entries()) {
         if ((line & 255) === 0) check();
         for (const segment of row) {
           if (!isBeforeSourceMapLeafStop(leaf, line, segment[0])) continue;
           if (segment.length === 1) continue;
           const rawSource = leaf.map.sources[segment[1]];
+          if (rawSource === undefined) continue;
           const resolved =
-            resolvedSources[segment[1]] ?? rawSource ?? "[unknown-source]";
-          const source = cachedSanitized(sourcesByRaw, resolved);
+            rawSource === null ? null : (resolvedSources[segment[1]] ?? null);
+          const source =
+            resolved === null ? null : cachedSanitized(sourcesByRaw, resolved);
           const name =
             segment.length === 5 ? (leaf.map.names[segment[4]] ?? null) : null;
           const generatedLine = leaf.offset.line + line + 1;
@@ -612,9 +628,11 @@ const normalizeSourceMap = (
             segment[0] + (line === 0 ? leaf.offset.column : 0);
           consumeExpandedBytes(
             context.budget,
-            cachedJsonBytes(sourceJsonBytes, source) +
+            (source === null ? 4 : cachedJsonBytes(sourceJsonBytes, source)) +
               (name === null ? 4 : cachedJsonBytes(nameJsonBytes, name)) +
               mappingRowBytes(
+                segment[1],
+                declarationBase + segment[1],
                 generatedLine,
                 generatedColumn,
                 segment[2] + 1,
@@ -623,6 +641,8 @@ const normalizeSourceMap = (
               (mappings.length === 0 ? 0 : 1),
           );
           mappings.push({
+            source_index: segment[1],
+            declaration_index: declarationBase + segment[1],
             generated_line: generatedLine,
             generated_column: generatedColumn,
             source,
@@ -632,6 +652,7 @@ const normalizeSourceMap = (
           });
         }
       }
+    }
     const modules = originalModuleEdges(originalSources, check, (edge) =>
       consumeExpandedBytes(
         context.budget,
@@ -705,23 +726,33 @@ const originalModuleEdges = (
   for (const source of sources) {
     check();
     if (source.artifact === null) continue;
-    const parsed = parseJavaScriptSource(source.artifact.text);
+    const sourceName = source.source;
+    if (sourceName === null) {
+      incomplete.push(
+        `unnamed source at declaration ${String(source.declaration_index)}`,
+      );
+      continue;
+    }
+    const parsed = parseJavaScriptSource(
+      source.artifact.text,
+      sourceParserPath(sourceName),
+    );
     check();
     if (parsed === null) {
-      incomplete.push(source.source);
+      incomplete.push(sourceName);
       continue;
     }
     // A recovered program still yields the imports it did parse, but nodes
     // after an unrecoverable point are missing, so the edges are a subset.
-    if (parsed.errors.length > 0) incomplete.push(source.source);
+    if (parsed.errors.length > 0) incomplete.push(sourceName);
     let unboundRequires: ReadonlySet<string> | undefined;
     traverseJavaScriptAst(parsed, {
       enter: (node) => {
         check();
         const dependency = originalDependency(node);
         if (dependency === null) return;
-        const { kind, specifier } = dependency;
-        if (kind === "require" && t.isCallExpression(node)) {
+        const { kind, specifier, requireCallee } = dependency;
+        if (requireCallee !== undefined) {
           unboundRequires ??= new Set(
             analyzeParsedJavaScriptReferences(parsed, "require")
               .filter(
@@ -733,7 +764,7 @@ const originalModuleEdges = (
                   `${String(location.start.line)}:${String(location.start.column)}`,
               ),
           );
-          const location = node.callee.loc?.start;
+          const location = requireCallee.loc?.start;
           if (
             location === undefined ||
             !unboundRequires.has(
@@ -742,14 +773,14 @@ const originalModuleEdges = (
           )
             return;
         }
-        const key = `${source.source}\0${kind}\0${specifier}`;
+        const key = `${sourceName}\0${kind}\0${specifier}`;
         if (seen.has(key)) return;
         seen.add(key);
         const edge = {
-          from_source: source.source,
+          from_source: sourceName,
           kind,
           specifier,
-          resolved_source: resolveOriginalSource(specifier, source.source),
+          resolved_source: resolveOriginalSource(specifier, sourceName),
         };
         beforeEdge(edge);
         edges.push(edge);
@@ -759,6 +790,17 @@ const originalModuleEdges = (
   return { edges, incomplete };
 };
 
+/** Select parser semantics from the source URL path, excluding query/fragment. */
+const sourceParserPath = (source: string): string => {
+  try {
+    return new URL(source).pathname;
+  } catch (cause: unknown) {
+    // Unresolved source identities can still carry a useful relative path.
+    void cause;
+    return source;
+  }
+};
+
 const checkOperation = (
   callerSignal: AbortSignal | undefined,
   operationSignal: AbortSignal | undefined,
@@ -766,7 +808,7 @@ const checkOperation = (
 ): void => {
   if (callerSignal?.aborted === true) throw callerSignal.reason;
   if (operationSignal?.aborted === true) throw operationSignal.reason;
-  if (Date.now() >= deadlineAt) throw new SourceMapDeadlineError();
+  if (performance.now() >= deadlineAt) throw new SourceMapDeadlineError();
 };
 
 const approvedUrl = (
@@ -840,10 +882,15 @@ const preflightResolvedSourceBytes = (
     }
     for (const source of map.sources) {
       check();
-      const sourceKey = source ?? "";
+      if (source === null) continue;
+      const sourceKey = source;
       let resolved = sourcesForRoot.get(sourceKey);
       if (resolved === undefined)
-        resolved = resolveSourceMapSource(source, map.sourceRoot, mapUrl);
+        resolved = resolveJavaScriptSourceMapUrl(
+          source,
+          map.sourceRoot,
+          mapUrl,
+        );
       const bytes = Buffer.byteLength(resolved, "utf8");
       if (bytes > SOURCE_MAP_RESPONSE_BYTES - resolvedBytes)
         throw resolvedSourceLimitFailure();
@@ -948,8 +995,13 @@ const sourceMapFailureReservation = (
   jsonBytes(status) -
   jsonBytes("fetch_failed");
 
-const sourceEntryOverheadBytes = (): number =>
-  Buffer.byteLength('{"source":,"artifact":null}');
+const sourceEntryOverheadBytes = (
+  sourceIndex: number,
+  declarationIndex: number,
+): number =>
+  Buffer.byteLength(
+    `{"source_index":${String(sourceIndex)},"declaration_index":${String(declarationIndex)},"source":,"artifact":null}`,
+  );
 
 const cachedJsonBytes = (cache: Map<string, number>, value: string): number => {
   const cached = cache.get(value);
@@ -968,13 +1020,15 @@ const cachedSanitized = (cache: Map<string, string>, value: string): string => {
 };
 
 const mappingRowBytes = (
+  sourceIndex: number,
+  declarationIndex: number,
   generatedLine: number,
   generatedColumn: number,
   originalLine: number,
   originalColumn: number,
 ): number =>
   Buffer.byteLength(
-    `{"generated_line":${String(generatedLine)},"generated_column":${String(generatedColumn)},"source":,"original_line":${String(originalLine)},"original_column":${String(originalColumn)},"name":}`,
+    `{"source_index":${String(sourceIndex)},"declaration_index":${String(declarationIndex)},"generated_line":${String(generatedLine)},"generated_column":${String(generatedColumn)},"source":,"original_line":${String(originalLine)},"original_column":${String(originalColumn)},"name":}`,
   );
 
 const resolveOriginalSource = (
@@ -1004,23 +1058,35 @@ const originalDependency = (
 ): {
   readonly kind: ParsedSourceMapItem["original_module_edges"][number]["kind"];
   readonly specifier: string;
+  readonly requireCallee?: t.Identifier;
 } | null => {
   if (
     t.isImportDeclaration(node) ||
     t.isExportAllDeclaration(node) ||
     t.isExportNamedDeclaration(node)
   )
-    return node.source === null || node.source === undefined
+    return node.source === null ||
+      node.source === undefined ||
+      (t.isImportDeclaration(node)
+        ? isTypeOnlyImportDeclaration(node)
+        : isTypeOnlyExportDeclaration(node))
       ? null
       : { kind: "static_import", specifier: node.source.value };
-  if (t.isImportExpression(node) && t.isStringLiteral(node.source))
-    return { kind: "dynamic_import", specifier: node.source.value };
+  if (t.isImportExpression(node)) {
+    const specifier = stringValue(node.source);
+    return specifier === undefined
+      ? null
+      : { kind: "dynamic_import", specifier };
+  }
   if (
-    t.isCallExpression(node) &&
-    t.isIdentifier(node.callee, { name: "require" }) &&
-    t.isStringLiteral(node.arguments[0])
-  )
-    return { kind: "require", specifier: node.arguments[0].value };
+    (t.isCallExpression(node) || t.isOptionalCallExpression(node)) &&
+    t.isIdentifier(node.callee, { name: "require" })
+  ) {
+    const specifier = stringValue(node.arguments[0]);
+    return specifier === undefined
+      ? null
+      : { kind: "require", specifier, requireCallee: node.callee };
+  }
   // `import x = require("m")` is only legal at module top level and always
   // refers to the host loader, so it needs no unbound-`require` check. The
   // `moduleReference` is an entity name for a local alias instead, which

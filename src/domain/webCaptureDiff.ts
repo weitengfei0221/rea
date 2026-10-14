@@ -70,9 +70,11 @@ const compareDimension = (
   after: ReadonlyMap<string, string>,
   complete: boolean,
   reason: string,
+  inventoryComplete = complete,
 ): Dimension => {
+  // Membership evidence can be complete even when selected content is unknown.
   const all = compareIdentities(before, after).filter(
-    ({ change }) => complete || change === "modified",
+    ({ change }) => inventoryComplete || change === "modified",
   );
   if (all.length > 0)
     return {
@@ -160,6 +162,7 @@ const storageDimension = (
     ),
     storageComparable(before, after, keysComplete, usageComplete),
     "Storage fingerprints, inventories, usage, or quota were unavailable or truncated in at least one observation.",
+    keysComplete,
   );
 };
 
@@ -204,12 +207,7 @@ const compareWebCaptureDimensions = (
         sectionsComplete(after, ["metadata"]),
       "Safe metadata capture was incomplete in at least one observation.",
     ),
-    webmcp: compareDimension(
-      webMcpMap(input.before.webmcp),
-      webMcpMap(input.after.webmcp),
-      webMcpComplete(input.before.webmcp) && webMcpComplete(input.after.webmcp),
-      "WebMCP discovery was unavailable or incomplete in at least one capture.",
-    ),
+    webmcp: webMcpDimension(input.before.webmcp, input.after.webmcp),
     accessibility: accessibilityDimension(before, after),
     storage: storageDimension(before, after),
   };
@@ -249,10 +247,37 @@ const networkIdentity = (
 ): string =>
   `net_${digestCanonicalValue({ method: request.method, url: request.url, resource_type: request.resource_type })}`;
 
+const networkResponseFields = [
+  "status",
+  "mime_type",
+  "encoded_data_length",
+] as const;
+type NetworkResponseField = (typeof networkResponseFields)[number];
+
+const sharedNetworkResponseFields = (
+  before: WebPageInspection,
+  after: WebPageInspection,
+): ReadonlyMap<string, ReadonlySet<NetworkResponseField>> => {
+  const shared = new Map<string, Set<NetworkResponseField>>();
+  for (const inspection of [before, after])
+    for (const request of inspection.network.requests) {
+      const identity = networkIdentity(request);
+      const fields = shared.get(identity) ?? new Set(networkResponseFields);
+      for (const field of networkResponseFields)
+        if (request[field] === null) fields.delete(field);
+      shared.set(identity, fields);
+    }
+  return shared;
+};
+
 const networkDimension = (
   before: WebPageInspection,
   after: WebPageInspection,
 ): Dimension => {
+  const responseFields = sharedNetworkResponseFields(before, after);
+  const responseFieldsComplete = [...responseFields.values()].every(
+    (fields) => fields.size === networkResponseFields.length,
+  );
   const selected = bodyShapesSelected(before) && bodyShapesSelected(after);
   const webSocketShapes =
     webSocketShapesSelected(before) && webSocketShapesSelected(after);
@@ -308,49 +333,61 @@ const networkDimension = (
   );
   const beforeWebSockets = webSocketGroups(before);
   const afterWebSockets = webSocketGroups(after);
+  const inventoryComplete = [before, after].every((inspection) =>
+    sectionsComplete(inspection, [
+      "network_requests",
+      "websocket_connections",
+      "websocket_frames",
+    ]),
+  );
   const [beforeWebSocketPayload, afterWebSocketPayload] = webSocketPayloadMaps(
     beforeWebSockets,
     afterWebSockets,
     webSocketShapes,
   );
-  return compareDimension(
+  const compared = compareDimension(
     new Map([
-      ...networkMap(before, sources),
+      ...networkMap(before, sources, responseFields),
       ...webSocketMetadataMap(beforeWebSockets),
       ...beforeWebSocketPayload,
     ]),
     new Map([
-      ...networkMap(after, sources),
+      ...networkMap(after, sources, responseFields),
       ...webSocketMetadataMap(afterWebSockets),
       ...afterWebSocketPayload,
     ]),
-    [before, after].every((inspection) =>
-      sectionsComplete(inspection, [
-        "network_requests",
-        "websocket_connections",
-        "websocket_frames",
-      ]),
-    ) &&
+    inventoryComplete &&
       shapesComplete &&
       webSocketPayloadBytesComplete &&
       webSocketShapesComplete,
     "Network capture or selected HTTP/WebSocket payload-shape coverage is attach-window limited, unavailable, or incomplete.",
+    inventoryComplete,
   );
+  return compared.status === "unchanged" && !responseFieldsComplete
+    ? {
+        ...compared,
+        status: "unknown",
+        reason:
+          "HTTP response status, MIME type, or byte-count evidence is incomplete.",
+      }
+    : compared;
 };
 
 const networkMap = (
   inspection: WebPageInspection,
   sources: ReadonlyMap<string, BodyShapeSources>,
+  responseFields: ReadonlyMap<string, ReadonlySet<NetworkResponseField>>,
 ): ReadonlyMap<string, string> => {
   const grouped = new Map<string, unknown[]>();
   for (const request of inspection.network.requests) {
     const identity = networkIdentity(request);
     const shapes = sources.get(identity);
     const values = grouped.get(identity) ?? [];
+    const response: Record<string, unknown> = {};
+    for (const field of responseFields.get(identity) ?? [])
+      response[field] = request[field];
     values.push({
-      status: request.status,
-      mime_type: request.mime_type,
-      encoded_data_length: request.encoded_data_length,
+      ...response,
       redirects: (request.redirects ?? []).map(
         ({
           request_timestamp: _requestTimestamp,
@@ -492,12 +529,51 @@ const webSocketPayloadMaps = (
   return [left, right];
 };
 
-const webMcpMap = (
-  discovery: WebMcpDiscovery | null,
-): ReadonlyMap<string, string> =>
-  discovery === null
-    ? new Map()
-    : keyed(discovery.tools.items, (tool) => tool.tool_key);
+const webMcpDimension = (
+  before: WebMcpDiscovery | null,
+  after: WebMcpDiscovery | null,
+): Dimension => {
+  const afterTools = new Map(
+    after?.tools.items.map((tool) => [tool.tool_key, tool]),
+  );
+  const unknownHints = new Set(
+    (before?.tools.items ?? [])
+      .filter((tool) => {
+        const other = afterTools.get(tool.tool_key);
+        return (
+          other !== undefined &&
+          (tool.annotations.consequential === undefined ||
+            other.annotations.consequential === undefined)
+        );
+      })
+      .map((tool) => tool.tool_key),
+  );
+  const project = (
+    discovery: WebMcpDiscovery | null,
+  ): ReadonlyMap<string, string> =>
+    keyed(
+      (discovery?.tools.items ?? []).map((tool) => {
+        if (!unknownHints.has(tool.tool_key)) return tool;
+        const { consequential: _unknown, ...annotations } = tool.annotations;
+        return { ...tool, annotations };
+      }),
+      (tool) => tool.tool_key,
+    );
+  const result = compareDimension(
+    project(before),
+    project(after),
+    webMcpComplete(before) && webMcpComplete(after),
+    "WebMCP discovery was unavailable or incomplete in at least one capture.",
+  );
+  return result.status === "unchanged" && unknownHints.size > 0
+    ? {
+        ...result,
+        status: "unknown",
+        reason:
+          "Consequential annotations were not recorded or were invalid in at least one capture.",
+      }
+    : result;
+};
 
 const webMcpComplete = (discovery: WebMcpDiscovery | null): boolean =>
   discovery !== null &&
@@ -646,16 +722,17 @@ const storageMap = (
       }),
     ],
   ]);
-  if (!includeKeys) return map;
   const add = (kind: string, keys: readonly string[]) => {
     for (const key of keys) {
       map.set(`storage:${kind}:${key}`, digestCanonicalValue(key));
     }
   };
-  add("local_storage", storage.local_storage_keys);
-  add("session_storage", storage.session_storage_keys);
-  add("indexed_db", storage.indexed_db_names);
-  add("cache", storage.cache_names);
+  if (includeKeys) {
+    add("local_storage", storage.local_storage_keys);
+    add("session_storage", storage.session_storage_keys);
+    add("indexed_db", storage.indexed_db_names);
+    add("cache", storage.cache_names);
+  }
   for (const fingerprint of storage.content_fingerprints) {
     const identity = `${fingerprint.scope}:${fingerprint.identity_sha256}`;
     if (!fingerprintIdentities.has(identity)) continue;

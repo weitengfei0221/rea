@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { expect, it } from "vitest";
 import { historicalHar } from "../../../tests/fixtures/historicalHar.js";
-import { decodeHarCapture, decodeHarText } from "./HarCapture.js";
+import { decodeCaptureText } from "./CaptureJson.js";
+import { decodeHarCapture } from "./HarCapture.js";
 
 it.each([
   { values: [] },
@@ -161,6 +162,19 @@ it("rejects identical duplicate core fields before schema validation", () => {
   expect(() => decodeHarCapture(text, [])).toThrow("duplicate");
 });
 
+it("names the violated HAR schema constraint without restating capture values", () => {
+  expect(() =>
+    decodeHarCapture(
+      JSON.stringify({
+        log: { creator: { name: "x", version: "1" }, entries: [] },
+      }),
+      [],
+    ),
+  ).toThrow(
+    "HAR schema validation failed: required (must have required property 'version').",
+  );
+});
+
 it("preserves prototype-named producer members through the capture boundary", () => {
   const text = JSON.stringify(historicalHar()).replace(
     '"cache":{}',
@@ -240,6 +254,39 @@ it.each(["9007199254740993", "4740993", "99"])(
         response: { bodySize: null },
       });
     else expect(result.records[0]?.reported).toMatchObject({ _big: null });
+  },
+);
+
+it.each([
+  { encoded: "1e3", sensitive: "1000" },
+  { encoded: "123.4500", sensitive: "123.45" },
+  { encoded: "0.0000001", sensitive: "1e-7" },
+])(
+  "excludes sensitive numbers introduced by JSON normalization: $encoded",
+  ({ encoded, sensitive }) => {
+    const text = JSON.stringify(historicalHar())
+      .replace('"log":{', `"_number":${encoded},"log":{`)
+      .replace('"cache":{}', `"cache":{},"_number":${encoded}`);
+    const result = decodeHarCapture(text, [sensitive]);
+    for (const projection of [result.container, ...result.records]) {
+      expect(projection.reported).toMatchObject({ _number: null });
+      expect(projection.numeric_literals).not.toContainEqual(
+        expect.objectContaining({ pointer: "/_number" }),
+      );
+      expect(projection.redactions).toContainEqual({
+        pointer: "/_number",
+        reason: "explicit-sensitive-value",
+      });
+    }
+    const unmarked = decodeHarCapture(text, []);
+    for (const projection of [unmarked.container, ...unmarked.records]) {
+      expect(projection.reported).toMatchObject({ _number: Number(encoded) });
+      expect(projection.numeric_literals).toContainEqual({
+        pointer: "/_number",
+        producer_type: "json-number",
+        literal: encoded,
+      });
+    }
   },
 );
 
@@ -563,18 +610,21 @@ it("ignores one leading byte-order mark, as HAR 1.2 requires of readers", () => 
   const text = JSON.stringify(historicalHar());
   const body = Buffer.from(text, "utf8");
   const marked = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), body]);
-  expect(decodeHarText(marked)).toBe(text);
-  expect(decodeHarCapture(decodeHarText(marked), [])).toEqual(
-    decodeHarCapture(decodeHarText(body), []),
+  expect(decodeCaptureText(marked, "HAR")).toBe(text);
+  expect(decodeHarCapture(decodeCaptureText(marked, "HAR"), [])).toEqual(
+    decodeHarCapture(decodeCaptureText(body, "HAR"), []),
   );
   // A second mark is content, not an encoding signature.
   expect(() =>
     decodeHarCapture(
-      decodeHarText(Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), marked])),
+      decodeCaptureText(
+        Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), marked]),
+        "HAR",
+      ),
       [],
     ),
   ).toThrow("HAR is malformed JSON.");
-  expect(() => decodeHarText(Buffer.from([0x7b, 0xff, 0x7d]))).toThrow(
-    "HAR is not valid UTF-8 JSON.",
-  );
+  expect(() =>
+    decodeCaptureText(Buffer.from([0x7b, 0xff, 0x7d]), "HAR"),
+  ).toThrow("HAR is not valid UTF-8 JSON.");
 });

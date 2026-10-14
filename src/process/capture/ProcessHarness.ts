@@ -5,7 +5,7 @@ import type { ProcessScenario } from "../../domain/process/processScenario.js";
 import { parseProcessCapture } from "../../domain/process/processCaptureParsing.js";
 import { err, ok, type Result } from "../../domain/result.js";
 import { AnalysisCapabilityUnavailableError } from "../../domain/analysisErrorCore.js";
-import type { AnalysisError } from "../../domain/analysisErrorBase.js";
+import { AnalysisError } from "../../domain/analysisErrorBase.js";
 import {
   describeProcessCaptureExecutionFailure,
   ProcessCaptureError,
@@ -24,7 +24,7 @@ import { startProcessSampler } from "./ProcessSampling.js";
 import { snapshotRoots } from "./FilesystemSnapshot.js";
 import { TerminalRenderer } from "./TerminalRenderer.js";
 import type { ProcessTimer } from "./ProcessTimer.js";
-import { normalizeProcessText } from "./ProcessNormalization.js";
+import { createProcessTextNormalizer } from "./ProcessNormalization.js";
 import { selectCapturedProcessGroupIds } from "../ProcessOwnershipProcessTree.js";
 import {
   awaitTerminalExit,
@@ -70,6 +70,7 @@ import {
   observeProcessStartIdentity,
   signalProcessWithStartIdentity,
 } from "../ProcessOwnershipObservation.js";
+import { monotonicProcessCaptureClock } from "./ProcessCaptureClock.js";
 
 interface StartedCaptureRuntime {
   readonly renderer: TerminalRenderer;
@@ -221,8 +222,7 @@ const cleanupFailedStartup = async (options: {
 
 const createTerminalRenderer = (
   scenario: ProcessScenario,
-  temporaryRoot: string,
-  terminalPid: () => number,
+  normalizeText: (value: string) => string,
   recordEvent: RecordProcessCaptureEvent,
 ): TerminalRenderer =>
   new TerminalRenderer({
@@ -230,8 +230,7 @@ const createTerminalRenderer = (
     rows: scenario.terminal.rows,
     scrollback: scenario.terminal.scrollback,
     maxBytes: scenario.limits.output_bytes,
-    normalize: (value) =>
-      normalizeProcessText(value, scenario, temporaryRoot, terminalPid()),
+    normalize: normalizeText,
     recordEvent,
   });
 
@@ -268,12 +267,16 @@ const startCaptureRuntime = async (
       options.signal,
     );
     const startedAt = new Date();
-    const started = Date.now();
+    const started = monotonicProcessCaptureClock();
     let lastOutput = started;
-    renderer = createTerminalRenderer(
+    const normalizeText = createProcessTextNormalizer(
       scenario,
       options.temporaryRoot,
       () => terminal?.pid ?? -1,
+    );
+    renderer = createTerminalRenderer(
+      scenario,
+      normalizeText,
       options.recordEvent,
     );
     terminal = spawn(scenario.executable, [...scenario.arguments], {
@@ -296,8 +299,9 @@ const startCaptureRuntime = async (
       ...options,
       terminal,
       started,
-      onOutput: () => (lastOutput = Date.now()),
+      onOutput: () => (lastOutput = monotonicProcessCaptureClock()),
       renderer,
+      normalizeText,
     });
     scheduleScenarioInteractions({
       ...options,
@@ -541,7 +545,7 @@ const completeCapture = async (options: {
     },
     {
       name: "after_settlement",
-      at_ms: Math.max(0, Date.now() - runtime.started),
+      at_ms: Math.max(0, monotonicProcessCaptureClock() - runtime.started),
       files: after.files,
       effects: classifyFilesystemEffects(options.before, after),
       truncated: after.truncated,
@@ -864,7 +868,7 @@ export const captureProcessScenario = async (
       const executionFailureReason =
         describeProcessCaptureExecutionFailure(cause);
       return err(
-        failure instanceof ProcessCaptureError
+        failure instanceof AnalysisError
           ? failure
           : new ProcessCaptureError("process capture failed", {
               cause,
@@ -882,7 +886,7 @@ export const captureProcessScenario = async (
       const failure = normalizeCaptureFailure(cause, signal);
       const executionFailure = describeProcessCaptureExecutionFailure(cause);
       return err(
-        failure instanceof ProcessCaptureError
+        failure instanceof AnalysisError
           ? failure
           : new ProcessCaptureError("process capture lifecycle failed", {
               cause,

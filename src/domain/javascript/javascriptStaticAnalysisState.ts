@@ -1,4 +1,5 @@
 import type * as t from "@babel/types";
+import type { JavaScriptOpenReceiverFact } from "./javascriptSemanticAnalysis.js";
 import type { JavaScriptRpcScan } from "./javascriptRpcEndpoints.js";
 
 import type {
@@ -10,6 +11,7 @@ import type {
   JavaScriptStaticStorage,
 } from "./javascriptStaticAnalysisTypes.js";
 import type {
+  ElectronCallPath,
   ElectronBrowserWindowFinding,
   ElectronContextBridgeFinding,
   ElectronIpcFinding,
@@ -36,6 +38,8 @@ export interface LocatedJavaScriptFinding<Value> {
 
 /** Mutable collections used during one inert AST traversal. */
 export interface JavaScriptAnalysisAccumulator {
+  electronCallPaths?: readonly ElectronCallPath[];
+  electronCallPathLimitReached?: boolean;
   readonly references: LocatedJavaScriptFinding<JavaScriptStaticReference>[];
   readonly endpoints: LocatedJavaScriptFinding<JavaScriptStaticEndpoint>[];
   readonly storage: LocatedJavaScriptFinding<JavaScriptStaticStorage>[];
@@ -61,15 +65,8 @@ export interface JavaScriptFindingContext {
   readonly rpcScan: JavaScriptRpcScan;
   readonly source: string;
   readonly accumulator: JavaScriptAnalysisAccumulator;
-  readonly openReceiverFacts?: ReadonlyMap<
-    number,
-    | "window"
-    | "indexed-db"
-    | "cache-storage"
-    | "local"
-    | "local-indexed-db"
-    | "local-cache-storage"
-  >;
+  readonly vitePreloadDependencyTable: readonly (string | undefined)[] | null;
+  readonly openReceiverFacts?: ReadonlyMap<number, JavaScriptOpenReceiverFact>;
   /** Proven Electron export path segments by root offset. */
   readonly electronBindings?: ReadonlyMap<number, readonly string[]>;
 }
@@ -87,6 +84,7 @@ export interface JavaScriptEndpointInput {
   readonly kind: JavaScriptStaticEndpoint["kind"];
   readonly value: string;
   readonly mechanism: string;
+  readonly interpretation?: "candidate";
 }
 
 /** Values required to append one module-attributable static finding. */

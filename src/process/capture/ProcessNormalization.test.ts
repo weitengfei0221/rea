@@ -1,6 +1,7 @@
 import { expect, it } from "vitest";
 
 import {
+  createProcessTextNormalizer,
   normalizeProcessSamples,
   normalizeProcessText,
 } from "./ProcessNormalization.js";
@@ -92,6 +93,42 @@ it("replaces caller-declared patterns literally, without expanding replacement p
       rootPid,
     ),
   ).toBe("listening on $&$&; $$; $1=alpha; tail $1");
+});
+
+it("reuses matchers while observing the terminal PID after launch", () => {
+  let pid = -1;
+  const normalize = createProcessTextNormalizer(
+    scenario({ ports: false, patterns: [] }),
+    "/temporary",
+    () => pid,
+  );
+  expect(normalize("root 41010 /workspace/item")).toBe(
+    "root 41010 <working-directory>/item",
+  );
+  pid = 41_010;
+  expect(normalize("root 41010 /workspace/item")).toBe(
+    "root <pid> <working-directory>/item",
+  );
+  pid = 42_020;
+  expect(normalize("root 41010 peer 42020")).toBe("root 41010 peer <pid>");
+});
+
+it("keeps equal-path priority and replacement aliases local to each capture", () => {
+  const declared = parseProcessScenario({
+    executable: "/selected/tool",
+    working_directory: "/selected",
+    filesystem_observation_paths: ["/selected", "<working-directory>"],
+    normalization: { paths: true, pids: false, ports: false, patterns: [] },
+  });
+  const normalize = createProcessTextNormalizer(declared, "/selected", -1);
+  const other = createProcessTextNormalizer(declared, "/other", -1);
+  const text = "/selected/item <working-directory>/source";
+  expect(normalize(text)).toBe(
+    "<temporary-root>/item <filesystem-root-1>/source",
+  );
+  expect(other(text)).toBe(
+    "<working-directory>/item <filesystem-root-1>/source",
+  );
 });
 
 it("preserves empty-pattern boundaries, including empty text", () => {
@@ -264,5 +301,49 @@ it("normalizes representative process identities and preserves null, zero, and u
   ]);
   expect(identifiersPreserved[1]?.command).toBe(
     "<working-directory>/program child 42020 parent 41010 group 43030 session 44040 listen:<port> selected",
+  );
+});
+
+it("normalizes nested paths once using the most specific selected identity", () => {
+  const declared = parseProcessScenario({
+    executable: "/workspace/project/bin/program",
+    working_directory: "/workspace/project",
+    filesystem_observation_paths: [
+      "/workspace/project/data",
+      "/workspace/project/data/cache",
+    ],
+    normalization: { paths: true, pids: false, ports: false, patterns: [] },
+  });
+  expect(
+    normalizeProcessText(
+      "/workspace/project/bin/program /workspace/project/data/cache/item /workspace/project/data/result /workspace/project/log /workspace/tmp",
+      declared,
+      "/workspace",
+      rootPid,
+    ),
+  ).toBe(
+    "<executable> <filesystem-root-1>/item <filesystem-root-0>/result <working-directory>/log <temporary-root>/tmp",
+  );
+});
+
+it("treats path metacharacters literally while preferring nested observed roots", () => {
+  const declared = parseProcessScenario({
+    executable: "/selected/[tool]+",
+    working_directory: "/selected",
+    filesystem_observation_paths: [
+      "/selected/(data)",
+      "/selected/(data)/cache",
+    ],
+    normalization: { paths: true, pids: false, ports: false, patterns: [] },
+  });
+  expect(
+    normalizeProcessText(
+      "/selected/[tool]+ /selected/(data)/cache/item /selected/(data)/file /selected/log /selected/toolll",
+      declared,
+      "/tmp",
+      rootPid,
+    ),
+  ).toBe(
+    "<executable> <filesystem-root-1>/item <filesystem-root-0>/file <working-directory>/log <working-directory>/toolll",
   );
 });

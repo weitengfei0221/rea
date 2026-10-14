@@ -195,6 +195,32 @@ describe("tRPC binding identity and bundled syntax", () => {
     ]);
   });
 
+  it("retains one client initializer across variable redeclarations", () => {
+    expect(
+      rpcEndpoints(`
+      var c;
+      var c = createTRPCClient({});
+      var c;
+      c.users.query();
+
+      var replaced;
+      var replaced = createTRPCClient({});
+      replaced = pool;
+      replaced.posts.query();
+
+      var initializedTwice = createTRPCClient({});
+      var initializedTwice = pool;
+      initializedTwice.comments.query();
+
+      var conditional;
+      if (flag) { var conditional = createTRPCClient({}); }
+      conditional.groups.query();
+    `),
+    ).toEqual([
+      { kind: "network", value: "users", mechanism: "trpc:procedure:query" },
+    ]);
+  });
+
   it("recognizes surviving factory names inside bundled call wrappers", () => {
     expect(
       rpcEndpoints(`
@@ -250,6 +276,63 @@ describe("GraphQL operation recognition", () => {
         mechanism: "graphql:subscription",
       },
     ]);
+  });
+
+  it("recognizes operations after leading fragment interpolations only when prior quasis are ignored", () => {
+    expect(
+      rpcEndpoints(`
+        const one = gql\`  \${CORE_FIELDS}
+          query CommentsForPost($postId: ID!) { comments { id } }\`;
+        const two = gql\`\${CORE_FIELDS}
+          # another fragment
+          ,\${MORE_FIELDS}
+          mutation UpdatePost($id: ID!) { updatePost(id: $id) { id } }\`;
+        const prose = gql\`fragment prose before interpolation
+          \${CORE_FIELDS}
+          query NotAnOperation { viewer { id } }\`;
+      `),
+    ).toEqual([
+      { kind: "network", value: "CommentsForPost", mechanism: "graphql:query" },
+      { kind: "network", value: "UpdatePost", mechanism: "graphql:mutation" },
+    ]);
+  });
+
+  it.each([
+    ["query", "query # header\nGetUser { user }"],
+    ["mutation", "mutation,# header\r\nGetUser { user }"],
+    ["subscription", "subscription# header\rGetUser { user }"],
+    ["query", "query GetUser # selection\n{ user }"],
+    ["query", "query GetUser { # field\nuser }"],
+    ["query", "query GetUser( # variable\n$id: ID!) { user }"],
+    ["query", "query GetUser # directive\n@skip(if: false) { user }"],
+    ["query", "query GetUser @ # directive name\nkeep { user }"],
+    [
+      "query",
+      "# prefix\nquery # one\n, # two\nGetUser # three\n{ # four\nuser }",
+    ],
+  ])("recognizes %s header comments in %s", (type, text) => {
+    const expected = [
+      { kind: "network", value: "GetUser", mechanism: `graphql:${type}` },
+    ];
+    expect(rpcEndpoints(`const doc = ${JSON.stringify(text)};`)).toEqual(
+      expected,
+    );
+    expect(rpcEndpoints("const doc = gql`" + text + "`; ")).toEqual(expected);
+  });
+
+  it.each([
+    "query # GetUser { user }",
+    "query GetUser # { user }",
+    "query GetUser { # user }",
+    "query # anonymous\n{ user }",
+    "query GetUser # prose\nparameters",
+    "query Get# split name\nUser { user }",
+    "query GetUser @ # missing directive name",
+    "query GetUser { # fragment\n...UserFields }",
+    "query\u00a0GetUser { user }",
+    "query\vGetUser { user }",
+  ])("keeps incomplete or unsupported header text unknown: %s", (text) => {
+    expect(rpcEndpoints(`const doc = ${JSON.stringify(text)};`)).toEqual([]);
   });
 
   it("retains operations after long ignored prefixes and long headers", () => {

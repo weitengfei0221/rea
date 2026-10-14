@@ -7,7 +7,7 @@ import { parseBinaryTarget } from "../../../src/application/BinaryTargetResolver
 import { AnalysisCancelledError } from "../../../src/domain/analysisErrorCore.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 import type { MipsElfMetadata } from "../../../src/domain/binaryTargetTypes.js";
-import { readMipsElfAbiFlags } from "../../../src/application/MipsElfAbiFlags.js";
+import { readMipsElfMetadata } from "../../../src/application/MipsElfMetadata.js";
 import { ok } from "../../../src/domain/result.js";
 import {
   ghidraMipsProfileParameters,
@@ -85,7 +85,7 @@ const inspect = async (
   const path = await writeFixture(bytes);
   const handle = await open(path, "r");
   try {
-    const result = await readMipsElfAbiFlags(
+    const result = await readMipsElfMetadata(
       handle,
       metadata(little),
       checkCancelled,
@@ -131,7 +131,9 @@ for (const little of [true, false]) {
     const fp64 = await inspect(bytes, little);
     assert.ok(fp64.ok);
     const changed = target({ ...metadata(little), abiFlags: fp64.value });
-    assert.match(ghidraMipsUnsupportedReason(changed) ?? "", /register modes/u);
+    assert.equal(fp64.value?.cpr1Size, 2);
+    assert.equal(fp64.value?.fpAbi, 6);
+    assert.match(ghidraMipsUnsupportedReason(changed) ?? "", /FP64/u);
     assert.notDeepEqual(ghidraMipsProfileParameters(changed), before);
   });
 }
@@ -154,7 +156,10 @@ for (const little of [true, false]) {
       else bytes.writeUInt32BE(sectionOffset, 32);
       const resolved = await resolveFixture(bytes);
       assert.equal(resolved.mips.abiFlags?.fpAbi, 5);
-      assert.equal(ghidraMipsUnsupportedReason(resolved), null);
+      assert.match(
+        ghidraMipsUnsupportedReason(resolved) ?? "",
+        /ABI declaration inspection is incomplete/u,
+      );
       assert.match(
         resolved.mips.limitations?.join(" ") ?? "",
         /section header table/u,
@@ -170,7 +175,7 @@ it("keeps declarations in uncaptured section headers unknown when program ABI da
   assert.equal(resolved.mips.abiFlags, null);
   assert.match(
     ghidraMipsUnsupportedReason(resolved) ?? "",
-    /inspected ABI.*unavailable headers remain unknown/u,
+    /ABI declaration inspection is incomplete.*unavailable headers remain unknown/u,
   );
 });
 for (const failure of ["conflicting", "outside", "duplicate"]) {
@@ -272,12 +277,11 @@ const unsupported: [string, (bytes: Buffer) => void, RegExp][] = [
     /MIPS32r2/u,
   ],
   [
-    "soft-float",
+    "soft-float with declared CPR1",
     (b) => {
-      b[abiOffset + 5] = 0;
       b[abiOffset + 7] = 3;
     },
-    /register modes/u,
+    /soft-float without CPR1/u,
   ],
   [
     "unspecified FP ABI",
@@ -309,6 +313,22 @@ for (const [name, change, reason] of unsupported) {
     );
   });
 }
+it.each([true, false])(
+  "resolves soft-float ABI metadata and commits its integer-register storage policy (little endian: %s)",
+  async (little) => {
+    const bytes = fixture(little);
+    bytes[abiOffset + 5] = 0;
+    bytes[abiOffset + 7] = 3;
+    const resolved = await resolveFixture(bytes);
+    assert.equal(resolved.mips.abiFlags?.cpr1Size, 0);
+    assert.equal(resolved.mips.abiFlags?.fpAbi, 3);
+    assert.equal(ghidraMipsUnsupportedReason(resolved), null);
+    assert.equal(
+      ghidraMipsProfileParameters(resolved).mips_soft_float_storage,
+      "o32-soft-float-prototype-v1",
+    );
+  },
+);
 it("preserves the caller's cancellation error during table inspection", async () => {
   const cancelled = new Error("caller cancellation sentinel");
   let checks = 0;
@@ -352,6 +372,26 @@ it("projects a malformed out-of-probe ABI record as a target error", async () =>
   assert.match(result.error.message, /ABI record lies outside the file/u);
   assert.deepEqual(await readFile(path), bytes);
 });
+
+for (const little of [true, false]) {
+  it(`refuses GNU ABI attributes by section type without reading attacker-controlled names or sizes (${little ? "LE" : "BE"})`, async () => {
+    const bytes = fixture(little);
+    const write16 = little
+      ? (value: number, offset: number) => bytes.writeUInt16LE(value, offset)
+      : (value: number, offset: number) => bytes.writeUInt16BE(value, offset);
+    const write32 = little
+      ? (value: number, offset: number) => bytes.writeUInt32LE(value, offset)
+      : (value: number, offset: number) => bytes.writeUInt32BE(value, offset);
+    write32(0xffffffff, 168); // Unknown name; the section type is authoritative.
+    write32(0x6ffffff5, 172); // SHT_GNU_ATTRIBUTES.
+    write32(0xfffffff0, 184); // Must not be read as a payload offset.
+    write32(0xffffffff, 188); // Must not control allocation.
+    write16(0, 50); // No section-name string table is required for detection.
+    const result = await inspect(bytes, little);
+    assert.ok(!result.ok);
+    assert.match(result.error, /GNU ABI attributes that REA does not inspect/u);
+  });
+}
 
 it("preserves cancellation instead of turning it into malformed target data", async () => {
   const directory = await createTestTempDirectory("rea-mips-resolution-");

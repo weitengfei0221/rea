@@ -8,6 +8,28 @@ import {
 } from "./javascriptSemanticAnalysis.fixture.js";
 
 describe("JavaScript semantic analysis: calls 1", () => {
+  it("does not assign computed method-name reads to method closures", () => {
+    const ir = analyzeJavaScriptSemantics(`
+      function outer() {
+        const name = "m";
+        const object = { [name]() { return 1; }, ["literal"]() { return 2; } };
+        class Example {
+          [name]() { return 3; }
+          ["literal"]() { return 4; }
+        }
+      }
+    `);
+    expect(ir.closureCaptures).toEqual([]);
+
+    const bodyRead = analyzeJavaScriptSemantics(`
+      function outer() {
+        const value = 1;
+        const object = { method() { return value; } };
+      }
+    `);
+    expect(bodyRead.closureCaptures).toHaveLength(1);
+  });
+
   it("links exact local calls to parameters, returns, and closure captures", () => {
     const ir = analyzeJavaScriptSemantics(`
       const prefix = "rea";
@@ -177,6 +199,34 @@ describe("JavaScript semantic analysis: calls 2", () => {
     expect(
       changed.functionFingerprints[0]?.components.literalSetSha256,
     ).not.toBe(left.functionFingerprints[0]?.components.literalSetSha256);
+  });
+
+  it("keeps nested callable syntax out of its owner's fingerprint", () => {
+    const analyze = (nested: number, owned: number) =>
+      analyzeJavaScriptSemantics(`
+        function outer() {
+          function inner() { return ${nested}; }
+          const object = { method() { return ${nested}; } };
+          class Nested { method() { return ${nested}; } }
+          return ${owned};
+        }
+      `);
+    const first = analyze(1, 2);
+    const changedNested = analyze(3, 2);
+    const changedOwner = analyze(1, 4);
+    const syntax = (ir: typeof first) =>
+      ir.functionFingerprints.map(({ components }) => ({
+        ast: components.normalizedAstSha256,
+        control: components.controlFlowSha256,
+        literals: components.literalSetSha256,
+      }));
+    const original = syntax(first);
+    expect(original).toHaveLength(4);
+    expect(syntax(changedNested)[0]).toEqual(original[0]);
+    for (const index of [1, 2, 3])
+      expect(syntax(changedNested)[index]).not.toEqual(original[index]);
+    expect(syntax(changedOwner)[0]).not.toEqual(original[0]);
+    expect(syntax(changedOwner).slice(1)).toEqual(original.slice(1));
   });
 
   it("keeps fingerprint relations ordered and effects scoped to their owner", () => {
